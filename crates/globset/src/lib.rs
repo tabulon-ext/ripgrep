@@ -5,11 +5,9 @@ Glob set matching is the process of matching one or more glob patterns against
 a single candidate path simultaneously, and returning all of the globs that
 matched. For example, given this set of globs:
 
-```ignore
-*.rs
-src/lib.rs
-src/**/foo.rs
-```
+* `*.rs`
+* `src/lib.rs`
+* `src/**/foo.rs`
 
 and a path `src/bar/baz/foo.rs`, then the set would report the first and third
 globs as matching.
@@ -19,7 +17,6 @@ globs as matching.
 This example shows how to match a single glob against a single file path.
 
 ```
-# fn example() -> Result<(), globset::Error> {
 use globset::Glob;
 
 let glob = Glob::new("*.rs")?.compile_matcher();
@@ -27,7 +24,7 @@ let glob = Glob::new("*.rs")?.compile_matcher();
 assert!(glob.is_match("foo.rs"));
 assert!(glob.is_match("foo/bar.rs"));
 assert!(!glob.is_match("Cargo.toml"));
-# Ok(()) } example().unwrap();
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 # Example: configuring a glob matcher
@@ -36,7 +33,6 @@ This example shows how to use a `GlobBuilder` to configure aspects of match
 semantics. In this example, we prevent wildcards from matching path separators.
 
 ```
-# fn example() -> Result<(), globset::Error> {
 use globset::GlobBuilder;
 
 let glob = GlobBuilder::new("*.rs")
@@ -45,7 +41,7 @@ let glob = GlobBuilder::new("*.rs")
 assert!(glob.is_match("foo.rs"));
 assert!(!glob.is_match("foo/bar.rs")); // no longer matches
 assert!(!glob.is_match("Cargo.toml"));
-# Ok(()) } example().unwrap();
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 # Example: match multiple globs at once
@@ -53,7 +49,6 @@ assert!(!glob.is_match("Cargo.toml"));
 This example shows how to match multiple glob patterns at once.
 
 ```
-# fn example() -> Result<(), globset::Error> {
 use globset::{Glob, GlobSetBuilder};
 
 let mut builder = GlobSetBuilder::new();
@@ -65,7 +60,7 @@ builder.add(Glob::new("src/**/foo.rs")?);
 let set = builder.build()?;
 
 assert_eq!(set.matches("src/bar/baz/foo.rs"), vec![0, 2]);
-# Ok(()) } example().unwrap();
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 # Syntax
@@ -99,26 +94,48 @@ Standard Unix-style glob syntax is supported:
 
 A `GlobBuilder` can be used to prevent wildcards from matching path separators,
 or to enable case insensitive matching.
+
+# Crate Features
+
+This crate includes optional features that can be enabled if necessary.
+These features are not required but may be useful depending on the use case.
+
+The following features are available:
+
+* **arbitrary** -
+  Enabling this feature introduces a public dependency on the
+  [`arbitrary`](https://crates.io/crates/arbitrary)
+  crate. Namely, it implements the `Arbitrary` trait from that crate for the
+  [`Glob`] type. This feature is disabled by default.
 */
 
 #![deny(missing_docs)]
 
-use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
-use std::error::Error as StdError;
-use std::fmt;
-use std::hash;
-use std::path::Path;
-use std::str;
+use std::{
+    borrow::Cow,
+    panic::{RefUnwindSafe, UnwindSafe},
+    path::Path,
+    sync::Arc,
+};
 
-use aho_corasick::AhoCorasick;
-use bstr::{ByteSlice, ByteVec, B};
-use regex::bytes::{Regex, RegexBuilder, RegexSet};
+use {
+    aho_corasick::AhoCorasick,
+    bstr::{B, ByteSlice, ByteVec},
+    regex_automata::{
+        PatternSet,
+        meta::Regex,
+        util::pool::{Pool, PoolGuard},
+    },
+};
 
-use crate::glob::MatchStrategy;
+use crate::{
+    glob::MatchStrategy,
+    pathutil::{file_name, file_name_ext, normalize_path},
+};
+
 pub use crate::glob::{Glob, GlobBuilder, GlobMatcher};
-use crate::pathutil::{file_name, file_name_ext, normalize_path};
 
+mod fnv;
 mod glob;
 mod pathutil;
 
@@ -146,6 +163,7 @@ pub struct Error {
 
 /// The kind of error that can occur when parsing a glob pattern.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ErrorKind {
     /// **DEPRECATED**.
     ///
@@ -165,23 +183,19 @@ pub enum ErrorKind {
     UnopenedAlternates,
     /// Occurs when a `{` is found without a matching `}`.
     UnclosedAlternates,
-    /// Occurs when an alternating group is nested inside another alternating
-    /// group, e.g., `{{a,b},{c,d}}`.
+    /// **DEPRECATED**.
+    ///
+    /// This error used to occur when an alternating group was nested inside
+    /// another alternating group, e.g., `{{a,b},{c,d}}`. However, this is now
+    /// supported and as such this error cannot occur.
     NestedAlternates,
     /// Occurs when an unescaped '\' is found at the end of a glob.
     DanglingEscape,
     /// An error associated with parsing or compiling a regex.
     Regex(String),
-    /// Hints that destructuring should not be exhaustive.
-    ///
-    /// This enum may grow additional variants, so this makes sure clients
-    /// don't count on exhaustive matching. (Otherwise, adding a new variant
-    /// could break existing code.)
-    #[doc(hidden)]
-    __Nonexhaustive,
 }
 
-impl StdError for Error {
+impl std::error::Error for Error {
     fn description(&self) -> &str {
         self.kind.description()
     }
@@ -222,13 +236,12 @@ impl ErrorKind {
             }
             ErrorKind::DanglingEscape => "dangling '\\'",
             ErrorKind::Regex(ref err) => err,
-            ErrorKind::__Nonexhaustive => unreachable!(),
         }
     }
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.glob {
             None => self.kind.fmt(f),
             Some(ref glob) => {
@@ -238,8 +251,8 @@ impl fmt::Display for Error {
     }
 }
 
-impl fmt::Display for ErrorKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl std::fmt::Display for ErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
             ErrorKind::InvalidRecursive
             | ErrorKind::UnclosedClass
@@ -251,35 +264,44 @@ impl fmt::Display for ErrorKind {
             ErrorKind::InvalidRange(s, e) => {
                 write!(f, "invalid range; '{}' > '{}'", s, e)
             }
-            ErrorKind::__Nonexhaustive => unreachable!(),
         }
     }
 }
 
 fn new_regex(pat: &str) -> Result<Regex, Error> {
-    RegexBuilder::new(pat)
-        .dot_matches_new_line(true)
-        .size_limit(10 * (1 << 20))
-        .dfa_size_limit(10 * (1 << 20))
-        .build()
-        .map_err(|err| Error {
+    let syntax = regex_automata::util::syntax::Config::new()
+        .utf8(false)
+        .dot_matches_new_line(true);
+    let config = Regex::config()
+        .utf8_empty(false)
+        .nfa_size_limit(Some(10 * (1 << 20)))
+        .hybrid_cache_capacity(10 * (1 << 20));
+    Regex::builder().syntax(syntax).configure(config).build(pat).map_err(
+        |err| Error {
             glob: Some(pat.to_string()),
+            kind: ErrorKind::Regex(err.to_string()),
+        },
+    )
+}
+
+fn new_regex_set(pats: Vec<String>) -> Result<Regex, Error> {
+    let syntax = regex_automata::util::syntax::Config::new()
+        .utf8(false)
+        .dot_matches_new_line(true);
+    let config = Regex::config()
+        .match_kind(regex_automata::MatchKind::All)
+        .utf8_empty(false)
+        .nfa_size_limit(Some(10 * (1 << 20)))
+        .hybrid_cache_capacity(10 * (1 << 20));
+    Regex::builder()
+        .syntax(syntax)
+        .configure(config)
+        .build_many(&pats)
+        .map_err(|err| Error {
+            glob: None,
             kind: ErrorKind::Regex(err.to_string()),
         })
 }
-
-fn new_regex_set<I, S>(pats: I) -> Result<RegexSet, Error>
-where
-    S: AsRef<str>,
-    I: IntoIterator<Item = S>,
-{
-    RegexSet::new(pats).map_err(|err| Error {
-        glob: None,
-        kind: ErrorKind::Regex(err.to_string()),
-    })
-}
-
-type Fnv = hash::BuildHasherDefault<fnv::FnvHasher>;
 
 /// GlobSet represents a group of globs that can be matched together in a
 /// single pass.
@@ -290,9 +312,17 @@ pub struct GlobSet {
 }
 
 impl GlobSet {
+    /// Create a new [`GlobSetBuilder`]. A `GlobSetBuilder` can be used to add
+    /// new patterns. Once all patterns have been added, `build` should be
+    /// called to produce a `GlobSet`, which can then be used for matching.
+    #[inline]
+    pub fn builder() -> GlobSetBuilder {
+        GlobSetBuilder::new()
+    }
+
     /// Create an empty `GlobSet`. An empty set matches nothing.
     #[inline]
-    pub fn empty() -> GlobSet {
+    pub const fn empty() -> GlobSet {
         GlobSet { len: 0, strats: vec![] }
     }
 
@@ -327,6 +357,43 @@ impl GlobSet {
             }
         }
         false
+    }
+
+    /// Returns true if all globs in this set match the path given.
+    ///
+    /// This will return true if the set of globs is empty, as in that case all
+    /// `0` of the globs will match.
+    ///
+    /// ```
+    /// use globset::{Glob, GlobSetBuilder};
+    ///
+    /// let mut builder = GlobSetBuilder::new();
+    /// builder.add(Glob::new("src/*").unwrap());
+    /// builder.add(Glob::new("**/*.rs").unwrap());
+    /// let set = builder.build().unwrap();
+    ///
+    /// assert!(set.matches_all("src/foo.rs"));
+    /// assert!(!set.matches_all("src/bar.c"));
+    /// assert!(!set.matches_all("test.rs"));
+    /// ```
+    pub fn matches_all<P: AsRef<Path>>(&self, path: P) -> bool {
+        self.matches_all_candidate(&Candidate::new(path.as_ref()))
+    }
+
+    /// Returns true if all globs in this set match the path given.
+    ///
+    /// This takes a Candidate as input, which can be used to amortize the cost
+    /// of preparing a path for matching.
+    ///
+    /// This will return true if the set of globs is empty, as in that case all
+    /// `0` of the globs will match.
+    pub fn matches_all_candidate(&self, path: &Candidate<'_>) -> bool {
+        for strat in &self.strats {
+            if !strat.matches_all(path) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Returns the sequence number of every glob pattern that matches the
@@ -388,18 +455,32 @@ impl GlobSet {
         into.dedup();
     }
 
-    fn new(pats: &[Glob]) -> Result<GlobSet, Error> {
-        if pats.is_empty() {
-            return Ok(GlobSet { len: 0, strats: vec![] });
+    /// Builds a new matcher from a collection of Glob patterns.
+    ///
+    /// Once a matcher is built, no new patterns can be added to it.
+    pub fn new<I, G>(globs: I) -> Result<GlobSet, Error>
+    where
+        I: IntoIterator<Item = G>,
+        G: AsRef<Glob>,
+    {
+        let mut it = globs.into_iter().peekable();
+        if it.peek().is_none() {
+            return Ok(GlobSet::empty());
         }
+
+        let mut len = 0;
         let mut lits = LiteralStrategy::new();
-        let mut base_lits = BasenameLiteralStrategy::new();
+        let mut base_lits = LiteralStrategy::new();
         let mut exts = ExtensionStrategy::new();
         let mut prefixes = MultiStrategyBuilder::new();
         let mut suffixes = MultiStrategyBuilder::new();
         let mut required_exts = RequiredExtensionStrategyBuilder::new();
+        let mut base_regexes = MultiStrategyBuilder::new();
         let mut regexes = MultiStrategyBuilder::new();
-        for (i, p) in pats.iter().enumerate() {
+        for (i, p) in it.enumerate() {
+            len += 1;
+
+            let p = p.as_ref();
             match MatchStrategy::new(p) {
                 MatchStrategy::Literal(lit) => {
                     lits.add(i, lit);
@@ -422,37 +503,64 @@ impl GlobSet {
                 MatchStrategy::RequiredExtension(ext) => {
                     required_exts.add(i, ext, p.regex().to_owned());
                 }
+                MatchStrategy::BasenameRegex(re) => {
+                    base_regexes.add(i, re);
+                }
                 MatchStrategy::Regex => {
-                    debug!("glob converted to regex: {:?}", p);
+                    debug!(
+                        "glob `{:?}` converted to regex: `{:?}`",
+                        p,
+                        p.regex()
+                    );
                     regexes.add(i, p.regex().to_owned());
                 }
             }
         }
         debug!(
             "built glob set; {} literals, {} basenames, {} extensions, \
-                {} prefixes, {} suffixes, {} required extensions, {} regexes",
-            lits.0.len(),
-            base_lits.0.len(),
+             {} prefixes, {} suffixes, {} required extensions, \
+             {} basename regexes, {} regexes",
+            lits.literals.len(),
+            base_lits.literals.len(),
             exts.0.len(),
             prefixes.literals.len(),
             suffixes.literals.len(),
             required_exts.0.len(),
+            base_regexes.literals.len(),
             regexes.literals.len()
         );
-        Ok(GlobSet {
-            len: pats.len(),
-            strats: vec![
-                GlobSetMatchStrategy::Extension(exts),
-                GlobSetMatchStrategy::BasenameLiteral(base_lits),
-                GlobSetMatchStrategy::Literal(lits),
-                GlobSetMatchStrategy::Suffix(suffixes.suffix()),
-                GlobSetMatchStrategy::Prefix(prefixes.prefix()),
-                GlobSetMatchStrategy::RequiredExtension(
-                    required_exts.build()?,
-                ),
-                GlobSetMatchStrategy::Regex(regexes.regex_set()?),
-            ],
-        })
+        let mut strats = Vec::with_capacity(8);
+        // Only add strategies that are populated
+        if !exts.0.is_empty() {
+            strats.push(GlobSetMatchStrategy::Extension(exts));
+        }
+        if !base_lits.literals.is_empty() {
+            strats.push(GlobSetMatchStrategy::BasenameLiteral(base_lits));
+        }
+        if !lits.literals.is_empty() {
+            strats.push(GlobSetMatchStrategy::Literal(lits));
+        }
+        if !suffixes.is_empty() {
+            strats.push(GlobSetMatchStrategy::Suffix(suffixes.suffix()));
+        }
+        if !prefixes.is_empty() {
+            strats.push(GlobSetMatchStrategy::Prefix(prefixes.prefix()));
+        }
+        if !required_exts.0.is_empty() {
+            strats.push(GlobSetMatchStrategy::RequiredExtension(
+                required_exts.build()?,
+            ));
+        }
+        if !base_regexes.is_empty() {
+            let mut set = base_regexes.regex_set()?;
+            set.basename = true;
+            strats.push(GlobSetMatchStrategy::Regex(set));
+        }
+        if !regexes.is_empty() {
+            strats.push(GlobSetMatchStrategy::Regex(regexes.regex_set()?));
+        }
+
+        Ok(GlobSet { len, strats })
     }
 }
 
@@ -471,9 +579,9 @@ pub struct GlobSetBuilder {
 }
 
 impl GlobSetBuilder {
-    /// Create a new GlobSetBuilder. A GlobSetBuilder can be used to add new
+    /// Create a new `GlobSetBuilder`. A `GlobSetBuilder` can be used to add new
     /// patterns. Once all patterns have been added, `build` should be called
-    /// to produce a `GlobSet`, which can then be used for matching.
+    /// to produce a [`GlobSet`], which can then be used for matching.
     pub fn new() -> GlobSetBuilder {
         GlobSetBuilder { pats: vec![] }
     }
@@ -482,7 +590,7 @@ impl GlobSetBuilder {
     ///
     /// Once a matcher is built, no new patterns can be added to it.
     pub fn build(&self) -> Result<GlobSet, Error> {
-        GlobSet::new(&self.pats)
+        GlobSet::new(self.pats.iter())
     }
 
     /// Add a new pattern to this set.
@@ -498,27 +606,59 @@ impl GlobSetBuilder {
 /// Constructing candidates has a very small cost associated with it, so
 /// callers may find it beneficial to amortize that cost when matching a single
 /// path against multiple globs or sets of globs.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Candidate<'a> {
     path: Cow<'a, [u8]>,
     basename: Cow<'a, [u8]>,
     ext: Cow<'a, [u8]>,
 }
 
+impl<'a> std::fmt::Debug for Candidate<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("Candidate")
+            .field("path", &self.path.as_bstr())
+            .field("basename", &self.basename.as_bstr())
+            .field("ext", &self.ext.as_bstr())
+            .finish()
+    }
+}
+
 impl<'a> Candidate<'a> {
     /// Create a new candidate for matching from the given path.
     pub fn new<P: AsRef<Path> + ?Sized>(path: &'a P) -> Candidate<'a> {
-        let path = normalize_path(Vec::from_path_lossy(path.as_ref()));
+        Self::from_cow(Vec::from_path_lossy(path.as_ref()))
+    }
+
+    /// Create a new candidate for matching from the given path as a sequence
+    /// of bytes.
+    ///
+    /// Generally speaking, this routine expects the bytes to be
+    /// _conventionally_ UTF-8. It is legal for the byte sequence to contain
+    /// invalid UTF-8. However, if the bytes are in some other encoding that
+    /// isn't ASCII compatible (for example, UTF-16), then the results of
+    /// matching are unspecified.
+    pub fn from_bytes<P: AsRef<[u8]> + ?Sized>(path: &'a P) -> Candidate<'a> {
+        Self::from_cow(Cow::Borrowed(path.as_ref()))
+    }
+
+    fn from_cow(path: Cow<'a, [u8]>) -> Candidate<'a> {
+        let path = normalize_path(path);
         let basename = file_name(&path).unwrap_or(Cow::Borrowed(B("")));
         let ext = file_name_ext(&basename).unwrap_or(Cow::Borrowed(B("")));
-        Candidate { path: path, basename: basename, ext: ext }
+        Candidate { path, basename, ext }
     }
 
     fn path_prefix(&self, max: usize) -> &[u8] {
-        if self.path.len() <= max {
-            &*self.path
+        if self.path.len() <= max { &*self.path } else { &self.path[..max] }
+    }
+
+    /// Returns the final component, including `..` for regex matching.
+    fn basename_for_regex(&self) -> &[u8] {
+        // Literal basename strategies skip `..`, but a regex can match it.
+        if self.basename.is_empty() && self.path.ends_with(b"..") {
+            b".."
         } else {
-            &self.path[..max]
+            &self.basename
         }
     }
 
@@ -534,7 +674,7 @@ impl<'a> Candidate<'a> {
 #[derive(Clone, Debug)]
 enum GlobSetMatchStrategy {
     Literal(LiteralStrategy),
-    BasenameLiteral(BasenameLiteralStrategy),
+    BasenameLiteral(LiteralStrategy),
     Extension(ExtensionStrategy),
     Prefix(PrefixStrategy),
     Suffix(SuffixStrategy),
@@ -546,8 +686,11 @@ impl GlobSetMatchStrategy {
     fn is_match(&self, candidate: &Candidate<'_>) -> bool {
         use self::GlobSetMatchStrategy::*;
         match *self {
-            Literal(ref s) => s.is_match(candidate),
-            BasenameLiteral(ref s) => s.is_match(candidate),
+            Literal(ref s) => s.is_match(candidate.path.as_bytes()),
+            BasenameLiteral(ref s) => {
+                !candidate.basename.is_empty()
+                    && s.is_match(candidate.basename.as_bytes())
+            }
             Extension(ref s) => s.is_match(candidate),
             Prefix(ref s) => s.is_match(candidate),
             Suffix(ref s) => s.is_match(candidate),
@@ -563,8 +706,14 @@ impl GlobSetMatchStrategy {
     ) {
         use self::GlobSetMatchStrategy::*;
         match *self {
-            Literal(ref s) => s.matches_into(candidate, matches),
-            BasenameLiteral(ref s) => s.matches_into(candidate, matches),
+            Literal(ref s) => {
+                s.matches_into(candidate.path.as_bytes(), matches)
+            }
+            BasenameLiteral(ref s) => {
+                if !candidate.basename.is_empty() {
+                    s.matches_into(candidate.basename.as_bytes(), matches);
+                }
+            }
             Extension(ref s) => s.matches_into(candidate, matches),
             Prefix(ref s) => s.matches_into(candidate, matches),
             Suffix(ref s) => s.matches_into(candidate, matches),
@@ -572,76 +721,74 @@ impl GlobSetMatchStrategy {
             Regex(ref s) => s.matches_into(candidate, matches),
         }
     }
+
+    fn matches_all(&self, candidate: &Candidate<'_>) -> bool {
+        use self::GlobSetMatchStrategy::*;
+        match *self {
+            Literal(ref s) => s.matches_all(candidate.path.as_bytes()),
+            BasenameLiteral(ref s) => {
+                !candidate.basename.is_empty()
+                    && s.matches_all(candidate.basename.as_bytes())
+            }
+            Extension(ref s) => s.matches_all(candidate),
+            Prefix(ref s) => s.matches_all(candidate),
+            Suffix(ref s) => s.matches_all(candidate),
+            RequiredExtension(ref s) => s.matches_all(candidate),
+            Regex(ref s) => s.matches_all(candidate),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
-struct LiteralStrategy(BTreeMap<Vec<u8>, Vec<usize>>);
+struct LiteralStrategy {
+    literals: fnv::HashMap<Vec<u8>, Vec<usize>>,
+    // Literal byte lengths modulo 64, checked before hashing the path.
+    lengths: u64,
+}
 
 impl LiteralStrategy {
     fn new() -> LiteralStrategy {
-        LiteralStrategy(BTreeMap::new())
+        LiteralStrategy { literals: fnv::HashMap::default(), lengths: 0 }
     }
 
     fn add(&mut self, global_index: usize, lit: String) {
-        self.0.entry(lit.into_bytes()).or_insert(vec![]).push(global_index);
+        self.lengths |= 1 << (lit.len() % 64);
+        self.literals
+            .entry(lit.into_bytes())
+            .or_insert(vec![])
+            .push(global_index);
     }
 
-    fn is_match(&self, candidate: &Candidate<'_>) -> bool {
-        self.0.contains_key(candidate.path.as_bytes())
+    fn is_match(&self, path: &[u8]) -> bool {
+        self.may_match_length(path.len()) && self.literals.contains_key(path)
     }
 
-    #[inline(never)]
-    fn matches_into(
-        &self,
-        candidate: &Candidate<'_>,
-        matches: &mut Vec<usize>,
-    ) {
-        if let Some(hits) = self.0.get(candidate.path.as_bytes()) {
-            matches.extend(hits);
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct BasenameLiteralStrategy(BTreeMap<Vec<u8>, Vec<usize>>);
-
-impl BasenameLiteralStrategy {
-    fn new() -> BasenameLiteralStrategy {
-        BasenameLiteralStrategy(BTreeMap::new())
-    }
-
-    fn add(&mut self, global_index: usize, lit: String) {
-        self.0.entry(lit.into_bytes()).or_insert(vec![]).push(global_index);
-    }
-
-    fn is_match(&self, candidate: &Candidate<'_>) -> bool {
-        if candidate.basename.is_empty() {
-            return false;
-        }
-        self.0.contains_key(candidate.basename.as_bytes())
+    fn matches_all(&self, path: &[u8]) -> bool {
+        self.literals.len() == 1 && self.is_match(path)
     }
 
     #[inline(never)]
-    fn matches_into(
-        &self,
-        candidate: &Candidate<'_>,
-        matches: &mut Vec<usize>,
-    ) {
-        if candidate.basename.is_empty() {
+    fn matches_into(&self, path: &[u8], matches: &mut Vec<usize>) {
+        if !self.may_match_length(path.len()) {
             return;
         }
-        if let Some(hits) = self.0.get(candidate.basename.as_bytes()) {
+        if let Some(hits) = self.literals.get(path) {
             matches.extend(hits);
         }
+    }
+
+    /// Returns whether a length could match, allowing collisions modulo 64.
+    fn may_match_length(&self, len: usize) -> bool {
+        self.lengths & (1 << (len % 64)) != 0
     }
 }
 
 #[derive(Clone, Debug)]
-struct ExtensionStrategy(HashMap<Vec<u8>, Vec<usize>, Fnv>);
+struct ExtensionStrategy(fnv::HashMap<Vec<u8>, Vec<usize>>);
 
 impl ExtensionStrategy {
     fn new() -> ExtensionStrategy {
-        ExtensionStrategy(HashMap::with_hasher(Fnv::default()))
+        ExtensionStrategy(fnv::HashMap::default())
     }
 
     fn add(&mut self, global_index: usize, ext: String) {
@@ -653,6 +800,10 @@ impl ExtensionStrategy {
             return false;
         }
         self.0.contains_key(candidate.ext.as_bytes())
+    }
+
+    fn matches_all(&self, candidate: &Candidate<'_>) -> bool {
+        self.0.len() == 1 && self.is_match(candidate)
     }
 
     #[inline(never)]
@@ -688,6 +839,19 @@ impl PrefixStrategy {
         false
     }
 
+    fn matches_all(&self, candidate: &Candidate<'_>) -> bool {
+        let path = candidate.path_prefix(self.longest);
+        let mut count = 0;
+        // If all the prefixes match, we should get exactly one match for each
+        // prefix at the beginning.
+        for m in self.matcher.find_overlapping_iter(path) {
+            if m.start() == 0 {
+                count += 1;
+            }
+        }
+        count == self.map.len()
+    }
+
     fn matches_into(
         &self,
         candidate: &Candidate<'_>,
@@ -720,6 +884,19 @@ impl SuffixStrategy {
         false
     }
 
+    fn matches_all(&self, candidate: &Candidate<'_>) -> bool {
+        let path = candidate.path_suffix(self.longest);
+        let mut count = 0;
+        // If all the suffixes match, we should get exactly one match
+        // for each suffix at the end.
+        for m in self.matcher.find_overlapping_iter(path) {
+            if m.end() == path.len() {
+                count += 1;
+            }
+        }
+        count == self.map.len()
+    }
+
     fn matches_into(
         &self,
         candidate: &Candidate<'_>,
@@ -735,7 +912,7 @@ impl SuffixStrategy {
 }
 
 #[derive(Clone, Debug)]
-struct RequiredExtensionStrategy(HashMap<Vec<u8>, Vec<(usize, Regex)>, Fnv>);
+struct RequiredExtensionStrategy(fnv::HashMap<Vec<u8>, Vec<(usize, Regex)>>);
 
 impl RequiredExtensionStrategy {
     fn is_match(&self, candidate: &Candidate<'_>) -> bool {
@@ -752,6 +929,22 @@ impl RequiredExtensionStrategy {
                 }
                 false
             }
+        }
+    }
+
+    fn matches_all(&self, candidate: &Candidate<'_>) -> bool {
+        if candidate.ext.is_empty() {
+            return false;
+        }
+        if let Some(regexes) = self.0.get(candidate.ext.as_bytes()) {
+            for &(_, ref re) in regexes {
+                if !re.is_match(candidate.path.as_bytes()) {
+                    return false;
+                }
+            }
+            true
+        } else {
+            false
         }
     }
 
@@ -776,13 +969,51 @@ impl RequiredExtensionStrategy {
 
 #[derive(Clone, Debug)]
 struct RegexSetStrategy {
-    matcher: RegexSet,
+    matcher: Regex,
     map: Vec<usize>,
+    basename: bool,
+    // We use a pool of PatternSets to hopefully allocating a fresh one on each
+    // call.
+    //
+    // TODO: In the next semver breaking release, we should drop this pool and
+    // expose an opaque type that wraps PatternSet. Then callers can provide
+    // it to `matches_into` directly. Callers might still want to use a pool
+    // or similar to amortize allocation, but that matches the status quo and
+    // absolves us of needing to do it here.
+    patset: Arc<Pool<PatternSet, PatternSetPoolFn>>,
 }
 
+type PatternSetPoolFn =
+    Box<dyn Fn() -> PatternSet + Send + Sync + UnwindSafe + RefUnwindSafe>;
+
 impl RegexSetStrategy {
+    /// Returns the part of the path matched by these regexes.
+    fn haystack<'a>(&self, candidate: &'a Candidate<'_>) -> &'a [u8] {
+        if self.basename {
+            candidate.basename_for_regex()
+        } else {
+            &candidate.path
+        }
+    }
+
     fn is_match(&self, candidate: &Candidate<'_>) -> bool {
-        self.matcher.is_match(candidate.path.as_bytes())
+        self.matcher.is_match(self.haystack(candidate))
+    }
+
+    fn find_matches(
+        &self,
+        candidate: &Candidate<'_>,
+    ) -> PoolGuard<'_, PatternSet, PatternSetPoolFn> {
+        let input = regex_automata::Input::new(self.haystack(candidate));
+        let mut patset = self.patset.get();
+        patset.clear();
+        self.matcher.which_overlapping_matches(&input, &mut patset);
+        patset
+    }
+
+    fn matches_all(&self, candidate: &Candidate<'_>) -> bool {
+        let patset = self.find_matches(candidate);
+        patset.is_full()
     }
 
     fn matches_into(
@@ -790,9 +1021,11 @@ impl RegexSetStrategy {
         candidate: &Candidate<'_>,
         matches: &mut Vec<usize>,
     ) {
-        for i in self.matcher.matches(candidate.path.as_bytes()) {
+        let patset = self.find_matches(candidate);
+        for i in patset.iter() {
             matches.push(self.map[i]);
         }
+        PoolGuard::put(patset);
     }
 }
 
@@ -818,7 +1051,7 @@ impl MultiStrategyBuilder {
 
     fn prefix(self) -> PrefixStrategy {
         PrefixStrategy {
-            matcher: AhoCorasick::new_auto_configured(&self.literals),
+            matcher: AhoCorasick::new(&self.literals).unwrap(),
             map: self.map,
             longest: self.longest,
         }
@@ -826,28 +1059,38 @@ impl MultiStrategyBuilder {
 
     fn suffix(self) -> SuffixStrategy {
         SuffixStrategy {
-            matcher: AhoCorasick::new_auto_configured(&self.literals),
+            matcher: AhoCorasick::new(&self.literals).unwrap(),
             map: self.map,
             longest: self.longest,
         }
     }
 
     fn regex_set(self) -> Result<RegexSetStrategy, Error> {
+        let matcher = new_regex_set(self.literals)?;
+        let pattern_len = matcher.pattern_len();
+        let create: PatternSetPoolFn =
+            Box::new(move || PatternSet::new(pattern_len));
         Ok(RegexSetStrategy {
-            matcher: new_regex_set(self.literals)?,
+            matcher,
             map: self.map,
+            basename: false,
+            patset: Arc::new(Pool::new(create)),
         })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.literals.is_empty()
     }
 }
 
 #[derive(Clone, Debug)]
 struct RequiredExtensionStrategyBuilder(
-    HashMap<Vec<u8>, Vec<(usize, String)>>,
+    fnv::HashMap<Vec<u8>, Vec<(usize, String)>>,
 );
 
 impl RequiredExtensionStrategyBuilder {
     fn new() -> RequiredExtensionStrategyBuilder {
-        RequiredExtensionStrategyBuilder(HashMap::new())
+        RequiredExtensionStrategyBuilder(fnv::HashMap::default())
     }
 
     fn add(&mut self, global_index: usize, ext: String, regex: String) {
@@ -858,7 +1101,7 @@ impl RequiredExtensionStrategyBuilder {
     }
 
     fn build(self) -> Result<RequiredExtensionStrategy, Error> {
-        let mut exts = HashMap::with_hasher(Fnv::default());
+        let mut exts = fnv::HashMap::default();
         for (ext, regexes) in self.0.into_iter() {
             exts.insert(ext.clone(), vec![]);
             for (global_index, regex) in regexes {
@@ -870,18 +1113,59 @@ impl RequiredExtensionStrategyBuilder {
     }
 }
 
+/// Escape meta-characters within the given glob pattern.
+///
+/// The escaping works by surrounding meta-characters with brackets. For
+/// example, `*` becomes `[*]`.
+///
+/// # Example
+///
+/// ```
+/// use globset::escape;
+///
+/// assert_eq!(escape("foo*bar"), "foo[*]bar");
+/// assert_eq!(escape("foo?bar"), "foo[?]bar");
+/// assert_eq!(escape("foo[bar"), "foo[[]bar");
+/// assert_eq!(escape("foo]bar"), "foo[]]bar");
+/// assert_eq!(escape("foo{bar"), "foo[{]bar");
+/// assert_eq!(escape("foo}bar"), "foo[}]bar");
+/// ```
+pub fn escape(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            // note that ! does not need escaping because it is only special
+            // inside brackets
+            '?' | '*' | '[' | ']' | '{' | '}' => {
+                escaped.push('[');
+                escaped.push(c);
+                escaped.push(']');
+            }
+            c => {
+                escaped.push(c);
+            }
+        }
+    }
+    escaped
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::glob::{Glob, GlobBuilder};
+
     use super::{GlobSet, GlobSetBuilder};
-    use crate::glob::Glob;
+
+    fn build_glob_set(globs: &[&str]) -> GlobSet {
+        let mut builder = GlobSetBuilder::new();
+        for glob in globs {
+            builder.add(Glob::new(glob).unwrap());
+        }
+        builder.build().unwrap()
+    }
 
     #[test]
     fn set_works() {
-        let mut builder = GlobSetBuilder::new();
-        builder.add(Glob::new("src/**/*.rs").unwrap());
-        builder.add(Glob::new("*.c").unwrap());
-        builder.add(Glob::new("src/lib.rs").unwrap());
-        let set = builder.build().unwrap();
+        let set = build_glob_set(&["src/**/*.rs", "*.c", "src/lib.rs"]);
 
         assert!(set.is_match("foo.c"));
         assert!(set.is_match("src/foo.c"));
@@ -889,6 +1173,9 @@ mod tests {
         assert!(!set.is_match("tests/foo.rs"));
         assert!(set.is_match("src/foo.rs"));
         assert!(set.is_match("src/grep/src/main.rs"));
+
+        assert!(!set.matches_all("src/lib.rs"));
+        assert!(!set.matches_all("src/a/b.c"));
 
         let matches = set.matches("src/lib.rs");
         assert_eq!(2, matches.len());
@@ -901,6 +1188,123 @@ mod tests {
         let set = GlobSetBuilder::new().build().unwrap();
         assert!(!set.is_match(""));
         assert!(!set.is_match("a"));
+        assert!(set.matches_all("a"));
+    }
+
+    #[test]
+    fn matches_all_literals() {
+        let set = build_glob_set(&["abc", "def"]);
+
+        assert!(!set.matches_all("abc"));
+        assert!(!set.matches_all("def"));
+
+        let set = build_glob_set(&["abc"]);
+
+        assert!(set.matches_all("abc"));
+    }
+
+    #[test]
+    fn matches_all_basename_literals() {
+        let set = build_glob_set(&["**/abc", "**/a.c"]);
+
+        assert!(!set.matches_all("foo/abc"));
+        assert!(!set.matches_all("foo/a.c"));
+
+        let set = build_glob_set(&["**/a.c"]);
+        assert!(set.matches_all("foo/a.c"));
+    }
+
+    #[test]
+    fn matches_all_extensions() {
+        let set = build_glob_set(&["**/*.rs", "**/*.c"]);
+
+        assert!(!set.matches_all("foo/a.rs"));
+        assert!(!set.matches_all("foo/a.c"));
+
+        let set = build_glob_set(&["**/*.rs", "*.rs"]);
+        assert!(set.matches_all("foo/a.rs"));
+    }
+
+    #[test]
+    fn matches_all_required_extensions() {
+        let set = build_glob_set(&["*.rs", "**/m*.rs", "a/*.rs"]);
+
+        assert!(set.matches_all("a/main.rs"));
+
+        assert!(!set.matches_all("main.rs"));
+        assert!(!set.matches_all("a/lib.rs"));
+    }
+
+    #[test]
+    fn matches_all_prefix() {
+        let set = build_glob_set(&["a*", "ab*", "ab/c*"]);
+
+        assert!(set.matches_all("ab/c/def"));
+        assert!(set.matches_all("ab/cd"));
+
+        assert!(!set.matches_all("abc"));
+        assert!(!set.matches_all("ab/x"));
+        assert!(!set.matches_all("a"));
+    }
+
+    #[test]
+    fn matches_all_suffix() {
+        let set = build_glob_set(&["*.rs", "*s", "*/main.rs"]);
+
+        assert!(set.matches_all("a/b/c/main.rs"));
+
+        assert!(!set.matches_all("foo.rs"));
+        assert!(!set.matches_all("as"));
+    }
+
+    #[test]
+    fn matches_all_regex() {
+        let set = GlobSet::new(&[
+            GlobBuilder::new("c*").case_insensitive(true).build().unwrap(),
+            Glob::new("*{rs,c}").unwrap(),
+        ])
+        .unwrap();
+
+        assert!(set.matches_all("c/main.rs"));
+        assert!(set.matches_all("C/main.c"));
+
+        assert!(!set.matches_all("Ca"));
+        assert!(!set.matches_all("foo.c"));
+    }
+
+    #[test]
+    fn basename_regex_with_path_rules() {
+        let globs: Vec<_> = ["**/.venv*", "**/*.py[cod]", "src/*"]
+            .iter()
+            .map(|pattern| {
+                GlobBuilder::new(pattern)
+                    .literal_separator(true)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        let set = GlobSet::new(globs).unwrap();
+        assert_eq!(set.matches("src/module.pyc"), vec![1, 2]);
+        assert_eq!(set.matches("src/nested/module.pyc"), vec![1]);
+        assert_eq!(set.matches("src/.venv-new"), vec![0, 2]);
+        assert!(set.matches_all("src/.venv.pyc"));
+        assert!(!set.matches_all("src/nested/.venv.pyc"));
+    }
+
+    #[test]
+    fn basename_regex_parent_component() {
+        let set = GlobSet::new([
+            GlobBuilder::new("**/.*").literal_separator(true).build().unwrap(),
+            Glob::new("**/[.][.]").unwrap(),
+        ])
+        .unwrap();
+        for path in ["..", "foo/..", "foo/bar/.."] {
+            assert!(set.is_match(path), "{path}");
+            assert!(set.matches_all(path), "{path}");
+            assert_eq!(set.matches(path), vec![0, 1], "{path}");
+        }
+        assert!(!set.matches_all("foo/."));
+        assert!(!set.matches_all("foo/a.."));
     }
 
     #[test]
@@ -908,5 +1312,113 @@ mod tests {
         let set: GlobSet = Default::default();
         assert!(!set.is_match(""));
         assert!(!set.is_match("a"));
+    }
+
+    #[test]
+    fn escape() {
+        use super::escape;
+        assert_eq!("foo", escape("foo"));
+        assert_eq!("foo[*]", escape("foo*"));
+        assert_eq!("[[][]]", escape("[]"));
+        assert_eq!("[*][?]", escape("*?"));
+        assert_eq!("src/[*][*]/[*].rs", escape("src/**/*.rs"));
+        assert_eq!("bar[[]ab[]]baz", escape("bar[ab]baz"));
+        assert_eq!("bar[[]!![]]!baz", escape("bar[!!]!baz"));
+    }
+
+    // This tests that regex matching doesn't "remember" the results of
+    // previous searches. That is, if any memory is reused from a previous
+    // search, then it should be cleared first.
+    #[test]
+    fn set_does_not_remember() {
+        let mut builder = GlobSetBuilder::new();
+        builder.add(Glob::new("*foo*").unwrap());
+        builder.add(Glob::new("*bar*").unwrap());
+        builder.add(Glob::new("*quux*").unwrap());
+        let set = builder.build().unwrap();
+
+        let matches = set.matches("ZfooZquuxZ");
+        assert_eq!(2, matches.len());
+        assert_eq!(0, matches[0]);
+        assert_eq!(2, matches[1]);
+
+        let matches = set.matches("nada");
+        assert_eq!(0, matches.len());
+    }
+
+    #[test]
+    fn debug() {
+        let mut builder = GlobSetBuilder::new();
+        builder.add(Glob::new("*foo*").unwrap());
+        builder.add(Glob::new("*bar*").unwrap());
+        builder.add(Glob::new("*quux*").unwrap());
+        assert_eq!(
+            format!("{builder:?}"),
+            "GlobSetBuilder { pats: [Glob(\"*foo*\"), Glob(\"*bar*\"), Glob(\"*quux*\")] }",
+        );
+    }
+    #[test]
+    fn literal_length_filter() {
+        let lengths = [0, 1, 63, 64, 65, 127, 128, 129];
+        let mut patterns: Vec<_> =
+            lengths.iter().map(|&len| "a".repeat(len)).collect();
+        patterns.extend(["é.py".to_owned(), r"foo\*bar".to_owned()]);
+        let set = GlobSet::new(patterns.iter().map(|pattern| {
+            GlobBuilder::new(pattern).backslash_escape(true).build().unwrap()
+        }))
+        .unwrap();
+        for (i, &len) in lengths.iter().enumerate() {
+            let path = "a".repeat(len);
+            assert!(set.is_match(&path));
+            assert_eq!(set.matches(&path), vec![i]);
+        }
+        assert_eq!(set.matches("é.py"), vec![8]);
+        assert_eq!(set.matches("foo*bar"), vec![9]);
+        for len in [2, 62, 66, 126, 130] {
+            assert!(!set.is_match("a".repeat(len)));
+        }
+        let literal = "a".repeat(65);
+        let duplicates = GlobSet::new([
+            Glob::new(&literal).unwrap(),
+            Glob::new(&literal).unwrap(),
+        ])
+        .unwrap();
+        assert!(duplicates.matches_all(&literal));
+        assert_eq!(duplicates.matches(&literal), vec![0, 1]);
+        assert!(!duplicates.is_match("a"));
+        assert!(!duplicates.matches_all("a"));
+        assert!(!duplicates.is_match("b".repeat(65)));
+    }
+
+    #[test]
+    fn basename_literal_length_filter() {
+        let lengths = [1, 63, 64, 65, 127, 128, 129];
+        let mut patterns: Vec<_> = lengths
+            .iter()
+            .map(|&len| format!("**/{}", "a".repeat(len)))
+            .collect();
+        patterns.extend(["**/é.py".to_owned(), r"**/foo\*bar".to_owned()]);
+        let set = GlobSet::new(patterns.iter().map(|pattern| {
+            GlobBuilder::new(pattern).backslash_escape(true).build().unwrap()
+        }))
+        .unwrap();
+        for (i, &len) in lengths.iter().enumerate() {
+            let path = format!("parent/{}", "a".repeat(len));
+            assert!(set.is_match(&path));
+            assert_eq!(set.matches(&path), vec![i]);
+        }
+        assert_eq!(set.matches("parent/é.py"), vec![7]);
+        assert_eq!(set.matches("parent/foo*bar"), vec![8]);
+        let literal = "a".repeat(65);
+        let glob = Glob::new(&format!("**/{literal}")).unwrap();
+        let duplicates = GlobSet::new([&glob, &glob]).unwrap();
+        let path = format!("parent/{literal}");
+        assert!(duplicates.matches_all(&path));
+        assert_eq!(duplicates.matches(&path), vec![0, 1]);
+        assert!(!duplicates.is_match("parent/a"));
+        assert!(!duplicates.is_match(format!("parent/{}", "b".repeat(65))));
+        let parent = GlobSet::new([Glob::new("**/..").unwrap()]).unwrap();
+        assert!(!parent.is_match("parent/.."));
+        assert!(!parent.matches_all("parent/.."));
     }
 }

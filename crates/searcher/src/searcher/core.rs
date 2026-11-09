@@ -1,17 +1,24 @@
-use std::cmp;
-
 use bstr::ByteSlice;
 
-use crate::line_buffer::BinaryDetection;
-use crate::lines::{self, LineStep};
-use crate::searcher::{Config, Range, Searcher};
-use crate::sink::{
-    Sink, SinkContext, SinkContextKind, SinkError, SinkFinish, SinkMatch,
-};
 use grep_matcher::{LineMatchKind, Matcher};
 
+use crate::{
+    line_buffer::BinaryDetection,
+    lines::{self, LineStep},
+    searcher::{Config, Range, Searcher},
+    sink::{
+        Sink, SinkContext, SinkContextKind, SinkError, SinkFinish, SinkMatch,
+    },
+};
+
+enum FastMatchResult {
+    Continue,
+    Stop,
+    SwitchToSlow,
+}
+
 #[derive(Debug)]
-pub struct Core<'s, M: 's, S> {
+pub(crate) struct Core<'s, M: 's, S> {
     config: &'s Config,
     matcher: M,
     searcher: &'s Searcher,
@@ -25,10 +32,12 @@ pub struct Core<'s, M: 's, S> {
     last_line_visited: usize,
     after_context_left: usize,
     has_sunk: bool,
+    has_matched: bool,
+    count: u64,
 }
 
 impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
-    pub fn new(
+    pub(crate) fn new(
         searcher: &'s Searcher,
         matcher: M,
         sink: S,
@@ -38,18 +47,20 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
             if searcher.config.line_number { Some(1) } else { None };
         let core = Core {
             config: &searcher.config,
-            matcher: matcher,
-            searcher: searcher,
-            sink: sink,
-            binary: binary,
+            matcher,
+            searcher,
+            sink,
+            binary,
             pos: 0,
             absolute_byte_offset: 0,
             binary_byte_offset: None,
-            line_number: line_number,
+            line_number,
             last_line_counted: 0,
             last_line_visited: 0,
             after_context_left: 0,
             has_sunk: false,
+            has_matched: false,
+            count: 0,
         };
         if !core.searcher.multi_line_with_matcher(&core.matcher) {
             if core.is_line_by_line_fast() {
@@ -61,23 +72,31 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         core
     }
 
-    pub fn pos(&self) -> usize {
+    pub(crate) fn pos(&self) -> usize {
         self.pos
     }
 
-    pub fn set_pos(&mut self, pos: usize) {
+    pub(crate) fn set_pos(&mut self, pos: usize) {
         self.pos = pos;
     }
 
-    pub fn binary_byte_offset(&self) -> Option<u64> {
+    fn count(&self) -> u64 {
+        self.count
+    }
+
+    fn increment_count(&mut self) {
+        self.count += 1;
+    }
+
+    pub(crate) fn binary_byte_offset(&self) -> Option<u64> {
         self.binary_byte_offset.map(|offset| offset as u64)
     }
 
-    pub fn matcher(&self) -> &M {
+    pub(crate) fn matcher(&self) -> &M {
         &self.matcher
     }
 
-    pub fn matched(
+    pub(crate) fn matched(
         &mut self,
         buf: &[u8],
         range: &Range,
@@ -85,18 +104,59 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         self.sink_matched(buf, range)
     }
 
-    pub fn binary_data(
+    pub(crate) fn binary_data(
         &mut self,
         binary_byte_offset: u64,
     ) -> Result<bool, S::Error> {
         self.sink.binary_data(&self.searcher, binary_byte_offset)
     }
 
-    pub fn begin(&mut self) -> Result<bool, S::Error> {
+    fn is_match(&self, line: &[u8]) -> Result<bool, S::Error> {
+        // We need to strip the line terminator here to match the
+        // semantics of line-by-line searching. Namely, regexes
+        // like `(?m)^$` can match at the final position beyond a
+        // line terminator, which is non-sensical in line oriented
+        // matching.
+        let line = lines::without_terminator(line, self.config.line_term);
+        self.matcher.is_match(line).map_err(S::Error::error_message)
+    }
+
+    pub(crate) fn find(
+        &mut self,
+        slice: &[u8],
+    ) -> Result<Option<Range>, S::Error> {
+        if self.has_exceeded_match_limit() {
+            return Ok(None);
+        }
+        match self.matcher().find(slice) {
+            Err(err) => Err(S::Error::error_message(err)),
+            Ok(None) => Ok(None),
+            Ok(Some(m)) => {
+                self.increment_count();
+                Ok(Some(m))
+            }
+        }
+    }
+
+    fn shortest_match(
+        &mut self,
+        slice: &[u8],
+    ) -> Result<Option<usize>, S::Error> {
+        if self.has_exceeded_match_limit() {
+            return Ok(None);
+        }
+        match self.matcher.shortest_match(slice) {
+            Err(err) => return Err(S::Error::error_message(err)),
+            Ok(None) => return Ok(None),
+            Ok(Some(m)) => Ok(Some(m)),
+        }
+    }
+
+    pub(crate) fn begin(&mut self) -> Result<bool, S::Error> {
         self.sink.begin(&self.searcher)
     }
 
-    pub fn finish(
+    pub(crate) fn finish(
         &mut self,
         byte_count: u64,
         binary_byte_offset: Option<u64>,
@@ -107,15 +167,22 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         )
     }
 
-    pub fn match_by_line(&mut self, buf: &[u8]) -> Result<bool, S::Error> {
+    pub(crate) fn match_by_line(
+        &mut self,
+        buf: &[u8],
+    ) -> Result<bool, S::Error> {
         if self.is_line_by_line_fast() {
-            self.match_by_line_fast(buf)
+            match self.match_by_line_fast(buf)? {
+                FastMatchResult::SwitchToSlow => self.match_by_line_slow(buf),
+                FastMatchResult::Continue => Ok(true),
+                FastMatchResult::Stop => Ok(false),
+            }
         } else {
             self.match_by_line_slow(buf)
         }
     }
 
-    pub fn roll(&mut self, buf: &[u8]) -> usize {
+    pub(crate) fn roll(&mut self, buf: &[u8]) -> usize {
         let consumed = if self.config.max_context() == 0 {
             buf.len()
         } else {
@@ -124,12 +191,17 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
             // separator (when before_context==0 and after_context>0), we
             // need to know something about the position of the previous
             // line visited, even if we're at the beginning of the buffer.
+            //
+            // ... however, we only need to find the N preceding lines based
+            // on before context. We can skip this (potentially costly, for
+            // large values of N) step when before_context==0.
             let context_start = lines::preceding(
                 buf,
                 self.config.line_term.as_byte(),
-                self.config.max_context(),
+                self.config.before_context,
             );
-            let consumed = cmp::max(context_start, self.last_line_visited);
+            let consumed =
+                std::cmp::max(context_start, self.last_line_visited);
             consumed
         };
         self.count_lines(buf, consumed);
@@ -140,7 +212,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         consumed
     }
 
-    pub fn detect_binary(
+    pub(crate) fn detect_binary(
         &mut self,
         buf: &[u8],
         range: &Range,
@@ -165,7 +237,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         }
     }
 
-    pub fn before_context_by_line(
+    pub(crate) fn before_context_by_line(
         &mut self,
         buf: &[u8],
         upto: usize,
@@ -201,7 +273,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         Ok(true)
     }
 
-    pub fn after_context_by_line(
+    pub(crate) fn after_context_by_line(
         &mut self,
         buf: &[u8],
         upto: usize,
@@ -209,6 +281,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         if self.after_context_left == 0 {
             return Ok(true);
         }
+        let exceeded_match_limit = self.has_exceeded_match_limit();
         let range = Range::new(self.last_line_visited, upto);
         let mut stepper = LineStep::new(
             self.config.line_term.as_byte(),
@@ -216,7 +289,16 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
             range.end(),
         );
         while let Some(line) = stepper.next_match(buf) {
-            if !self.sink_after_context(buf, &line)? {
+            if exceeded_match_limit
+                && self.is_match(&buf[line])? != self.config.invert_match
+            {
+                let after_context_left = self.after_context_left;
+                self.set_pos(line.end());
+                if !self.sink_matched(buf, &line)? {
+                    return Ok(false);
+                }
+                self.after_context_left = after_context_left - 1;
+            } else if !self.sink_after_context(buf, &line)? {
                 return Ok(false);
             }
             if self.after_context_left == 0 {
@@ -226,7 +308,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         Ok(true)
     }
 
-    pub fn other_context_by_line(
+    pub(crate) fn other_context_by_line(
         &mut self,
         buf: &[u8],
         upto: usize,
@@ -255,6 +337,12 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
             range.end(),
         );
         while let Some(line) = stepper.next_match(buf) {
+            if self.has_exceeded_match_limit()
+                && !self.config.passthru
+                && self.after_context_left == 0
+            {
+                return Ok(false);
+            }
             let matched = {
                 // Stripping the line terminator is necessary to prevent some
                 // classes of regexes from matching the empty position *after*
@@ -264,13 +352,14 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
                     &buf[line],
                     self.config.line_term,
                 );
-                match self.matcher.shortest_match(slice) {
-                    Err(err) => return Err(S::Error::error_message(err)),
-                    Ok(result) => result.is_some(),
-                }
+                self.shortest_match(slice)?.is_some()
             };
             self.set_pos(line.end());
-            if matched != self.config.invert_match {
+
+            let success = matched != self.config.invert_match;
+            if success {
+                self.has_matched = true;
+                self.increment_count();
                 if !self.before_context_by_line(buf, line.start())? {
                     return Ok(false);
                 }
@@ -286,40 +375,55 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
                     return Ok(false);
                 }
             }
+            if self.config.stop_on_nonmatch && !success && self.has_matched {
+                return Ok(false);
+            }
         }
         Ok(true)
     }
 
-    fn match_by_line_fast(&mut self, buf: &[u8]) -> Result<bool, S::Error> {
-        debug_assert!(!self.config.passthru);
+    fn match_by_line_fast(
+        &mut self,
+        buf: &[u8],
+    ) -> Result<FastMatchResult, S::Error> {
+        use FastMatchResult::*;
 
+        debug_assert!(!self.config.passthru);
         while !buf[self.pos()..].is_empty() {
+            if self.config.stop_on_nonmatch && self.has_matched {
+                return Ok(SwitchToSlow);
+            }
             if self.config.invert_match {
                 if !self.match_by_line_fast_invert(buf)? {
-                    return Ok(false);
+                    break;
                 }
             } else if let Some(line) = self.find_by_line_fast(buf)? {
+                self.has_matched = true;
+                self.increment_count();
                 if self.config.max_context() > 0 {
                     if !self.after_context_by_line(buf, line.start())? {
-                        return Ok(false);
+                        return Ok(Stop);
                     }
                     if !self.before_context_by_line(buf, line.start())? {
-                        return Ok(false);
+                        return Ok(Stop);
                     }
                 }
                 self.set_pos(line.end());
                 if !self.sink_matched(buf, &line)? {
-                    return Ok(false);
+                    return Ok(Stop);
                 }
             } else {
                 break;
             }
         }
         if !self.after_context_by_line(buf, buf.len())? {
-            return Ok(false);
+            return Ok(Stop);
+        }
+        if self.has_exceeded_match_limit() && self.after_context_left == 0 {
+            return Ok(Stop);
         }
         self.set_pos(buf.len());
-        Ok(true)
+        Ok(Continue)
     }
 
     #[inline(always)]
@@ -344,6 +448,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         if invert_match.is_empty() {
             return Ok(true);
         }
+        self.has_matched = true;
         if !self.after_context_by_line(buf, invert_match.start())? {
             return Ok(false);
         }
@@ -356,7 +461,11 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
             invert_match.end(),
         );
         while let Some(line) = stepper.next_match(buf) {
+            self.increment_count();
             if !self.sink_matched(buf, &line)? {
+                return Ok(false);
+            }
+            if self.has_exceeded_match_limit() {
                 return Ok(false);
             }
         }
@@ -365,7 +474,7 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
 
     #[inline(always)]
     fn find_by_line_fast(
-        &self,
+        &mut self,
         buf: &[u8],
     ) -> Result<Option<Range>, S::Error> {
         debug_assert!(!self.searcher.multi_line_with_matcher(&self.matcher));
@@ -373,6 +482,9 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
 
         let mut pos = self.pos();
         while !buf[pos..].is_empty() {
+            if self.has_exceeded_match_limit() {
+                return Ok(None);
+            }
             match self.matcher.find_candidate_line(&buf[pos..]) {
                 Err(err) => return Err(S::Error::error_message(err)),
                 Ok(None) => return Ok(None),
@@ -396,23 +508,10 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
                         self.config.line_term.as_byte(),
                         Range::zero(i).offset(pos),
                     );
-                    // We need to strip the line terminator here to match the
-                    // semantics of line-by-line searching. Namely, regexes
-                    // like `(?m)^$` can match at the final position beyond a
-                    // line terminator, which is non-sensical in line oriented
-                    // matching.
-                    let slice = lines::without_terminator(
-                        &buf[line],
-                        self.config.line_term,
-                    );
-                    match self.matcher.is_match(slice) {
-                        Err(err) => return Err(S::Error::error_message(err)),
-                        Ok(true) => return Ok(Some(line)),
-                        Ok(false) => {
-                            pos = line.end();
-                            continue;
-                        }
+                    if self.is_match(&buf[line])? {
+                        return Ok(Some(line));
                     }
+                    pos = line.end();
                 }
             }
         }
@@ -577,7 +676,21 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
         if self.config.passthru {
             return false;
         }
+        if self.config.stop_on_nonmatch && self.has_matched {
+            return false;
+        }
         if let Some(line_term) = self.matcher.line_terminator() {
+            // FIXME: This works around a bug in grep-regex where it does
+            // not set the line terminator of the regex itself, and thus
+            // line anchors like `(?m:^)` and `(?m:$)` will not match
+            // anything except for `\n`. So for now, we just disable the fast
+            // line-by-line searcher which requires the regex to be able to
+            // deal with line terminators correctly. The slow line-by-line
+            // searcher strips line terminators and thus absolves the regex
+            // engine from needing to care about whether they are `\n` or NUL.
+            if line_term.as_byte() == b'\x00' {
+                return false;
+            }
             if line_term == self.config.line_term {
                 return true;
             }
@@ -592,5 +705,9 @@ impl<'s, M: Matcher, S: Sink> Core<'s, M, S> {
             }
         }
         false
+    }
+
+    fn has_exceeded_match_limit(&self) -> bool {
+        self.config.max_matches.map_or(false, |limit| self.count() >= limit)
     }
 }

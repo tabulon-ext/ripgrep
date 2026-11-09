@@ -178,11 +178,15 @@ search. By default, when you search a directory, ripgrep will ignore all of
 the following:
 
 1. Files and directories that match glob patterns in these three categories:
-      1. gitignore globs (including global and repo-specific globs).
+      1. `.gitignore` globs (including global and repo-specific globs). This
+         includes `.gitignore` files in parent directories that are part of the
+         same `git` repository. (Unless the `--no-require-git` flag is given.)
       2. `.ignore` globs, which take precedence over all gitignore globs
-         when there's a conflict.
+         when there's a conflict. This includes `.ignore` files in parent
+         directories.
       3. `.rgignore` globs, which take precedence over all `.ignore` globs
-         when there's a conflict.
+         when there's a conflict. This includes `.rgignore` files in parent
+         directories.
 2. Hidden files and directories.
 3. Binary files. (ripgrep considers any file with a `NUL` byte to be binary.)
 4. Symbolic links aren't followed.
@@ -190,7 +194,8 @@ the following:
 All of these things can be toggled using various flags provided by ripgrep:
 
 1. You can disable all ignore-related filtering with the `--no-ignore` flag.
-2. Hidden files and directories can be searched with the `--hidden` flag.
+2. Hidden files and directories can be searched with the `--hidden` (`-.` for
+short) flag.
 3. Binary files can be searched via the `--text` (`-a` for short) flag.
    Be careful with this flag! Binary files may emit control characters to your
    terminal, which might cause strange behavior.
@@ -264,24 +269,23 @@ patterns while the next section covers file type filtering.
 
 In our ripgrep source code (see [Basics](#basics) for instructions on how to
 get a source archive to search), let's say we wanted to see which things depend
-on `clap`, our argument parser.
+on `lexopt`, our argument parser.
 
 We could do this:
 
 ```
-$ rg clap
+$ rg lexopt
 [lots of results]
 ```
 
 But this shows us many things, and we're only interested in where we wrote
-`clap` as a dependency. Instead, we could limit ourselves to TOML files, which
-is how dependencies are communicated to Rust's build tool, Cargo:
+`lexopt` as a dependency. Instead, we could limit ourselves to TOML files,
+which is how dependencies are communicated to Rust's build tool, Cargo:
 
 ```
-$ rg clap -g '*.toml'
+$ rg lexopt -g '*.toml'
 Cargo.toml
-35:clap = "2.26"
-51:clap = "2.26"
+57:lexopt = "0.3.0"
 ```
 
 The `-g '*.toml'` syntax says, "make sure every file searched matches this
@@ -291,7 +295,7 @@ shell from expanding the `*`.
 If we wanted, we could tell ripgrep to search anything *but* `*.toml` files:
 
 ```
-$ rg clap -g '!*.toml'
+$ rg lexopt -g '!*.toml'
 [lots of results]
 ```
 
@@ -307,7 +311,7 @@ is, later globs will override earlier globs. For example, the following command
 will search only `*.toml` files:
 
 ```
-$ rg clap -g '!*.toml' -g '*.toml'
+$ rg lexopt -g '!*.toml' -g '*.toml'
 ```
 
 Interestingly, reversing the order of the globs in this case will match
@@ -359,13 +363,13 @@ $ rg 'int main' -tc
 Just as you can write blacklist globs, you can blacklist file types too:
 
 ```
-$ rg clap --type-not rust
+$ rg lexopt --type-not rust
 ```
 
 or, more succinctly,
 
 ```
-$ rg clap -Trust
+$ rg lexopt -Trust
 ```
 
 That is, `-t` means "include files of this type" where as `-T` means "exclude
@@ -566,12 +570,15 @@ $ cat $HOME/.ripgreprc
 --type-add
 web:*.{html,css,js}*
 
+# Search hidden files / directories (e.g. dotfiles) by default
+--hidden
+
 # Using glob patterns to include/exclude files or folders
---glob=!git/*
+--glob=!.git/*
 
 # or
 --glob
-!git/*
+!.git/*
 
 # Set the colors.
 --colors=line:none
@@ -993,10 +1000,14 @@ used options that will likely impact how you use ripgrep on a regular basis.
   if the pattern contains any uppercase letters. Usually this flag is put into
   alias or a config file.
 * `-F/--fixed-strings`: Disable regular expression matching and treat the pattern
-   as a literal string. 
+   as a literal string.
 * `-w/--word-regexp`: Require that all matches of the pattern be surrounded
   by word boundaries. That is, given `pattern`, the `--word-regexp` flag will
-  cause ripgrep to behave as if `pattern` were actually `\b(?:pattern)\b`.
+  cause ripgrep to behave as if `pattern` were actually
+  `\b{start-half}(?:pattern)\b{end-half}`.
+  (Unlike `\b`, these half-boundaries don't require a word character on one
+  side. For example, `rg -w -e -2` will match `-2` in `(-2)` but `rg '\b-2\b'`
+  will not.)
 * `-c/--count`: Report a count of total matched lines.
 * `--files`: Print the files that ripgrep *would* search, but don't actually
   search them.

@@ -21,6 +21,7 @@
 * [When I run `rg`, why does it execute some other command?](#rg-other-cmd)
 * [How do I create an alias for ripgrep on Windows?](#rg-alias-windows)
 * [How do I create a PowerShell profile?](#powershell-profile)
+* [Why do paths and encoding look wrong in Git Bash on Windows?](#windows-paths-encoding)
 * [How do I pipe non-ASCII content to ripgrep on Windows?](#pipe-non-ascii-windows)
 * [How can I search and replace with ripgrep?](#search-and-replace)
 * [How is ripgrep licensed?](#license)
@@ -61,18 +62,24 @@ patch release out with a fix. However, no promises are made.
 Does ripgrep have a man page?
 </h3>
 
-Yes! Whenever ripgrep is compiled on a system with `asciidoctor` or `asciidoc`
-present, then a man page is generated from ripgrep's argv parser. After
-compiling ripgrep, you can find the man page like so from the root of the
-repository:
+Yes. If you installed ripgrep through a package manager on a Unix system, then
+it would have ideally been installed for you in the proper location. In which
+case, `man rg` should just work.
+
+Otherwise, you can ask ripgrep to generate the man page:
 
 ```
-$ find ./target -name rg.1 -print0 | xargs -0 ls -t | head -n1
-./target/debug/build/ripgrep-79899d0edd4129ca/out/rg.1
+$ mkdir -p man/man1
+$ rg --generate man > man/man1/rg.1
+$ MANPATH="$PWD/man" man rg
 ```
 
-Running `man -l ./target/debug/build/ripgrep-79899d0edd4129ca/out/rg.1` will
-show the man page in your normal pager.
+Or, if your version of `man` supports the `-l/--local-file` flag, then this
+will suffice:
+
+```
+$ rg --generate man | man -l -
+```
 
 Note that the man page's documentation for options is equivalent to the output
 shown in `rg --help`. To see more condensed documentation (one line per flag),
@@ -86,22 +93,59 @@ The man page is also included in all
 Does ripgrep have support for shell auto-completion?
 </h3>
 
-Yes! Shell completions can be found in the
-[same directory as the man page](#manpage)
-after building ripgrep. Zsh completions are maintained separately and committed
-to the repository in `complete/_rg`.
+Yes! If you installed ripgrep through a package manager on a Unix system, then
+the shell completion files included in the release archive should have been
+installed for you automatically. If not, you can generate completions using
+ripgrep's command line interface.
 
-Shell completions are also included in all
-[ripgrep binary releases](https://github.com/BurntSushi/ripgrep/releases).
+For **bash**:
 
-For **bash**, move `rg.bash` to
-`$XDG_CONFIG_HOME/bash_completion` or `/etc/bash_completion.d/`.
+```
+$ dir="$XDG_CONFIG_HOME/bash_completion"
+$ mkdir -p "$dir"
+$ rg --generate complete-bash > "$dir/rg.bash"
+```
 
-For **fish**, move `rg.fish` to `$HOME/.config/fish/completions/`.
+For **fish**:
 
-For **zsh**, move `_rg` to one of your `$fpath` directories.
+```
+$ dir="$XDG_CONFIG_HOME/fish/completions"
+$ mkdir -p "$dir"
+$ rg --generate complete-fish > "$dir/rg.fish"
+```
 
-For **PowerShell**, add `. _rg.ps1` to your PowerShell
+For **zsh**, the recommended approach is:
+
+```zsh
+$ dir="$HOME/.zsh-complete"
+$ mkdir -p "$dir"
+$ rg --generate complete-zsh > "$dir/_rg"
+```
+
+And then add `$HOME/.zsh-complete` to your `fpath` in, e.g., your
+`$HOME/.zshrc` file:
+
+```zsh
+fpath=($HOME/.zsh-complete $fpath)
+```
+
+Or if you'd prefer to load and generate completions at the same time, you can
+add the following to your `$HOME/.zshrc` file:
+
+```zsh
+$ source <(rg --generate complete-zsh)
+```
+
+Note though that while this approach is easier to setup, is generally slower
+than the previous method, and will add more time to loading your shell prompt.
+
+For **PowerShell**, create the completions:
+
+```
+$ rg --generate complete-powershell > _rg.ps1
+```
+
+And then add `. _rg.ps1` to your PowerShell
 [profile](https://technet.microsoft.com/en-us/library/bb613488(v=vs.85).aspx)
 (note the leading period). If the `_rg.ps1` file is not on your `PATH`, do
 `. /path/to/_rg.ps1` instead.
@@ -222,8 +266,8 @@ The `--colors` flag is a bit more complicated. The general format is:
   to bold the output or not).
 * `{value}` is determined by the value of `{attribute}`. If
   `{attribute}` is `style`, then `{value}` should be one of `nobold`,
-  `bold`, `nointense`, `intense`, `nounderline` or `underline`. If
-  `{attribute}` is `fg` or `bg`, then `{value}` should be a color.
+  `bold`, `nointense`, `intense`, `nounderline`, `underline`, `noitalic` or
+  `italic`. If `{attribute}` is `fg` or `bg`, then `{value}` should be a color.
 
 A color is specified by either one of eight of English names, a single 256-bit
 number or an RGB triple (with over 16 million possible values, or "true
@@ -242,8 +286,8 @@ As a special case, `--colors '{type}:none'` will clear all colors and styles
 associated with `{type}`, which lets you start with a clean slate (instead of
 building on top of ripgrep's default color settings).
 
-Here's an example that makes highlights the matches with a nice blue background
-with bolded white text:
+Here's an example that highlights the matches with a nice blue background with
+bolded white text:
 
 ```
 $ rg somepattern \
@@ -786,6 +830,33 @@ Any PowerShell code in this file gets evaluated at the start of console. This
 way you can have own aliases to be created at start.
 
 
+<h3 name="windows-paths-encoding">
+Why do paths and encoding look wrong in Git Bash on Windows?
+</h3>
+
+ripgrep prints file paths using the platform's native path separator (`\` on
+Windows). Under Git Bash, MSYS2, or Cygwin, that can look awkward next to
+Unix-style tools, and console locale settings can also garble non-ASCII
+output even though ripgrep is emitting the file bytes unchanged.
+
+If you want forward slashes in printed paths when using those shells, set
+`--path-separator`. A common alias is:
+
+```
+alias rg='rg --path-separator //'
+```
+
+The double slash avoids Git Bash rewriting a single `/`.
+
+If non-ASCII characters (for example umlauts in file contents) look wrong in
+a Windows console, try enabling the system UTF-8 locale. Note that this is
+a system-wide change and may affect other programs.
+
+See also
+[Why does using a leading `/` on Windows fail?](#because-cygwin) and
+[How do I pipe non-ASCII content to ripgrep on Windows?](#pipe-non-ascii-windows)
+
+
 <h3 name="pipe-non-ascii-windows">
 How do I pipe non-ASCII content to ripgrep on Windows?
 </h3>
@@ -1010,15 +1081,11 @@ tools like ack or The Silver Searcher weren't already doing.
 How can I donate to ripgrep or its maintainers?
 </h3>
 
-As of now, you can't. While I believe the various efforts that are being
-undertaken to help fund FOSS are extremely important, they aren't a good fit
-for me. ripgrep is and I hope will remain a project of love that I develop in
-my free time. As such, involving money---even in the form of donations given
-without expectations---would severely change that dynamic for me personally.
+I welcome [sponsorship](https://github.com/sponsors/BurntSushi/).
 
-Instead, I'd recommend donating to something else that is doing work that you
-find meaningful. If you would like suggestions, then my favorites are:
+Or if you'd prefer, donating to a charitable organization that you like would
+also be most welcome. My favorites are:
 
 * [The Internet Archive](https://archive.org/donate/)
-* [Rails Girls](https://railsgirlssummerofcode.org/campaign/)
+* [Rails Girls](https://railsgirlssummerofcode.org/)
 * [Wikipedia](https://wikimediafoundation.org/support/)

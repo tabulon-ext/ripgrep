@@ -1,33 +1,31 @@
 use std::borrow::Cow;
 
-use bstr::{ByteSlice, ByteVec};
+use bstr::ByteSlice;
 
 /// The final component of the path, if it is a normal file.
 ///
-/// If the path terminates in ., .., or consists solely of a root of prefix,
-/// file_name will return None.
-pub fn file_name<'a>(path: &Cow<'a, [u8]>) -> Option<Cow<'a, [u8]>> {
+/// If the path terminates in `..`, or consists solely of a root of prefix,
+/// file_name will return `None`.
+pub(crate) fn file_name<'a>(path: &Cow<'a, [u8]>) -> Option<Cow<'a, [u8]>> {
     if path.is_empty() {
-        return None;
-    } else if path.last_byte() == Some(b'.') {
         return None;
     }
     let last_slash = path.rfind_byte(b'/').map(|i| i + 1).unwrap_or(0);
-    Some(match *path {
+    let got = match *path {
         Cow::Borrowed(path) => Cow::Borrowed(&path[last_slash..]),
-        Cow::Owned(ref path) => {
-            let mut path = path.clone();
-            path.drain_bytes(..last_slash);
-            Cow::Owned(path)
-        }
-    })
+        Cow::Owned(ref path) => Cow::Owned(path[last_slash..].to_vec()),
+    };
+    if got == &b".."[..] {
+        return None;
+    }
+    Some(got)
 }
 
 /// Return a file extension given a path's file name.
 ///
 /// Note that this does NOT match the semantics of std::path::Path::extension.
 /// Namely, the extension includes the `.` and matching is otherwise more
-/// liberal. Specifically, the extenion is:
+/// liberal. Specifically, the extension is:
 ///
 /// * None, if the file name given is empty;
 /// * None, if there is no embedded `.`;
@@ -39,7 +37,9 @@ pub fn file_name<'a>(path: &Cow<'a, [u8]>) -> Option<Cow<'a, [u8]>> {
 /// a pattern like `*.rs` is obviously trying to match files with a `rs`
 /// extension, but it also matches files like `.rs`, which doesn't have an
 /// extension according to std::path::Path::extension.
-pub fn file_name_ext<'a>(name: &Cow<'a, [u8]>) -> Option<Cow<'a, [u8]>> {
+pub(crate) fn file_name_ext<'a>(
+    name: &Cow<'a, [u8]>,
+) -> Option<Cow<'a, [u8]>> {
     if name.is_empty() {
         return None;
     }
@@ -49,18 +49,14 @@ pub fn file_name_ext<'a>(name: &Cow<'a, [u8]>) -> Option<Cow<'a, [u8]>> {
     };
     Some(match *name {
         Cow::Borrowed(name) => Cow::Borrowed(&name[last_dot_at..]),
-        Cow::Owned(ref name) => {
-            let mut name = name.clone();
-            name.drain_bytes(..last_dot_at);
-            Cow::Owned(name)
-        }
+        Cow::Owned(ref name) => Cow::Owned(name[last_dot_at..].to_vec()),
     })
 }
 
 /// Normalizes a path to use `/` as a separator everywhere, even on platforms
 /// that recognize other characters as separators.
 #[cfg(unix)]
-pub fn normalize_path(path: Cow<'_, [u8]>) -> Cow<'_, [u8]> {
+pub(crate) fn normalize_path(path: Cow<'_, [u8]>) -> Cow<'_, [u8]> {
     // UNIX only uses /, so we're good.
     path
 }
@@ -68,11 +64,11 @@ pub fn normalize_path(path: Cow<'_, [u8]>) -> Cow<'_, [u8]> {
 /// Normalizes a path to use `/` as a separator everywhere, even on platforms
 /// that recognize other characters as separators.
 #[cfg(not(unix))]
-pub fn normalize_path(mut path: Cow<[u8]>) -> Cow<[u8]> {
+pub(crate) fn normalize_path(mut path: Cow<[u8]>) -> Cow<[u8]> {
     use std::path::is_separator;
 
     for i in 0..path.len() {
-        if path[i] == b'/' || !is_separator(path[i] as char) {
+        if path[i] == b'/' || !is_separator(char::from(path[i])) {
             continue;
         }
         path.to_mut()[i] = b'/';
@@ -84,9 +80,25 @@ pub fn normalize_path(mut path: Cow<[u8]>) -> Cow<[u8]> {
 mod tests {
     use std::borrow::Cow;
 
-    use bstr::{ByteVec, B};
+    use bstr::{B, ByteVec};
 
-    use super::{file_name_ext, normalize_path};
+    use super::{file_name, file_name_ext, normalize_path};
+
+    macro_rules! name {
+        ($name:ident, $path:expr, $expected:expr) => {
+            #[test]
+            fn $name() {
+                let bs = Vec::from($path);
+                let got = file_name(&Cow::Owned(bs));
+                assert_eq!($expected.map(|s| Cow::Borrowed(B(s))), got);
+            }
+        };
+    }
+
+    name!(name1, "foo/bar", Some("bar"));
+    name!(name2, "foo", Some("foo"));
+    name!(name3, "foo/..", None::<&str>);
+    name!(name4, "", None::<&str>);
 
     macro_rules! ext {
         ($name:ident, $file_name:expr, $ext:expr) => {

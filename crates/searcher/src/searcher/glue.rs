@@ -1,16 +1,14 @@
-use std::cmp;
-use std::io;
-
-use crate::line_buffer::{LineBufferReader, DEFAULT_BUFFER_CAPACITY};
-use crate::lines::{self, LineStep};
-use crate::sink::{Sink, SinkError};
 use grep_matcher::Matcher;
 
-use crate::searcher::core::Core;
-use crate::searcher::{Config, Range, Searcher};
+use crate::{
+    line_buffer::{DEFAULT_BUFFER_CAPACITY, LineBufferReader},
+    lines::{self, LineStep},
+    searcher::{Config, Range, Searcher, core::Core},
+    sink::{Sink, SinkError},
+};
 
 #[derive(Debug)]
-pub struct ReadByLine<'s, M, R, S> {
+pub(crate) struct ReadByLine<'s, M, R, S> {
     config: &'s Config,
     core: Core<'s, M, S>,
     rdr: LineBufferReader<'s, R>,
@@ -19,10 +17,10 @@ pub struct ReadByLine<'s, M, R, S> {
 impl<'s, M, R, S> ReadByLine<'s, M, R, S>
 where
     M: Matcher,
-    R: io::Read,
+    R: std::io::Read,
     S: Sink,
 {
-    pub fn new(
+    pub(crate) fn new(
         searcher: &'s Searcher,
         matcher: M,
         read_from: LineBufferReader<'s, R>,
@@ -37,15 +35,24 @@ where
         }
     }
 
-    pub fn run(mut self) -> Result<(), S::Error> {
+    pub(crate) fn run(mut self) -> Result<(), S::Error> {
         if self.core.begin()? {
-            while self.fill()? && self.core.match_by_line(self.rdr.buffer())? {
+            while self.fill()? {
+                if !self.core.match_by_line(self.rdr.buffer())? {
+                    self.consume_remaining();
+                    break;
+                }
             }
         }
         self.core.finish(
             self.rdr.absolute_byte_offset(),
             self.rdr.binary_byte_offset(),
         )
+    }
+
+    fn consume_remaining(&mut self) {
+        let consumed = self.core.pos();
+        self.rdr.consume(consumed);
     }
 
     fn fill(&mut self) -> Result<bool, S::Error> {
@@ -87,13 +94,13 @@ where
 }
 
 #[derive(Debug)]
-pub struct SliceByLine<'s, M, S> {
+pub(crate) struct SliceByLine<'s, M, S> {
     core: Core<'s, M, S>,
     slice: &'s [u8],
 }
 
 impl<'s, M: Matcher, S: Sink> SliceByLine<'s, M, S> {
-    pub fn new(
+    pub(crate) fn new(
         searcher: &'s Searcher,
         matcher: M,
         slice: &'s [u8],
@@ -103,14 +110,14 @@ impl<'s, M: Matcher, S: Sink> SliceByLine<'s, M, S> {
 
         SliceByLine {
             core: Core::new(searcher, matcher, write_to, true),
-            slice: slice,
+            slice,
         }
     }
 
-    pub fn run(mut self) -> Result<(), S::Error> {
+    pub(crate) fn run(mut self) -> Result<(), S::Error> {
         if self.core.begin()? {
             let binary_upto =
-                cmp::min(self.slice.len(), DEFAULT_BUFFER_CAPACITY);
+                std::cmp::min(self.slice.len(), DEFAULT_BUFFER_CAPACITY);
             let binary_range = Range::new(0, binary_upto);
             if !self.core.detect_binary(self.slice, &binary_range)? {
                 while !self.slice[self.core.pos()..].is_empty()
@@ -132,7 +139,7 @@ impl<'s, M: Matcher, S: Sink> SliceByLine<'s, M, S> {
 }
 
 #[derive(Debug)]
-pub struct MultiLine<'s, M, S> {
+pub(crate) struct MultiLine<'s, M, S> {
     config: &'s Config,
     core: Core<'s, M, S>,
     slice: &'s [u8],
@@ -140,7 +147,7 @@ pub struct MultiLine<'s, M, S> {
 }
 
 impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
-    pub fn new(
+    pub(crate) fn new(
         searcher: &'s Searcher,
         matcher: M,
         slice: &'s [u8],
@@ -151,15 +158,15 @@ impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
         MultiLine {
             config: &searcher.config,
             core: Core::new(searcher, matcher, write_to, true),
-            slice: slice,
+            slice,
             last_match: None,
         }
     }
 
-    pub fn run(mut self) -> Result<(), S::Error> {
+    pub(crate) fn run(mut self) -> Result<(), S::Error> {
         if self.core.begin()? {
             let binary_upto =
-                cmp::min(self.slice.len(), DEFAULT_BUFFER_CAPACITY);
+                std::cmp::min(self.slice.len(), DEFAULT_BUFFER_CAPACITY);
             let binary_range = Range::new(0, binary_upto);
             if !self.core.detect_binary(self.slice, &binary_range)? {
                 let mut keepgoing = true;
@@ -318,11 +325,9 @@ impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
     }
 
     fn find(&mut self) -> Result<Option<Range>, S::Error> {
-        match self.core.matcher().find(&self.slice[self.core.pos()..]) {
-            Err(err) => Err(S::Error::error_message(err)),
-            Ok(None) => Ok(None),
-            Ok(Some(m)) => Ok(Some(m.offset(self.core.pos()))),
-        }
+        self.core
+            .find(&self.slice[self.core.pos()..])
+            .map(|m| m.map(|m| m.offset(self.core.pos())))
     }
 
     /// Advance the search position based on the previous match.
@@ -347,8 +352,10 @@ impl<'s, M: Matcher, S: Sink> MultiLine<'s, M, S> {
 
 #[cfg(test)]
 mod tests {
-    use crate::searcher::{BinaryDetection, SearcherBuilder};
-    use crate::testutil::{KitchenSink, RegexMatcher, SearcherTester};
+    use crate::{
+        searcher::{BinaryDetection, SearcherBuilder},
+        testutil::{KitchenSink, RegexMatcher, SearcherTester},
+    };
 
     use super::*;
 
@@ -1511,5 +1518,32 @@ and exhibited clearly, with a label attached.\
                 }),
             )
             .unwrap();
+    }
+
+    // See: https://github.com/BurntSushi/ripgrep/issues/2260
+    #[test]
+    fn regression_2260() {
+        use grep_regex::RegexMatcherBuilder;
+
+        use crate::SearcherBuilder;
+
+        let matcher = RegexMatcherBuilder::new()
+            .line_terminator(Some(b'\n'))
+            .build(r"^\w+$")
+            .unwrap();
+        let mut searcher = SearcherBuilder::new().line_number(true).build();
+
+        let mut matched = false;
+        searcher
+            .search_slice(
+                &matcher,
+                b"GATC\n",
+                crate::sinks::UTF8(|_, _| {
+                    matched = true;
+                    Ok(true)
+                }),
+            )
+            .unwrap();
+        assert!(matched);
     }
 }

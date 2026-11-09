@@ -1,5 +1,5 @@
 use crate::hay::SHERLOCK;
-use crate::util::{cmd_exists, sort_lines, Dir, TestCommand};
+use crate::util::{Dir, TestCommand, cmd_exists, sort_lines};
 
 // This file contains "miscellaneous" tests that were either written before
 // features were tracked more explicitly, or were simply written without
@@ -140,6 +140,18 @@ rgtest!(word, |dir: Dir, mut cmd: TestCommand| {
 
     let expected = "\
 For the Doctor Watsons of this world, as opposed to the Sherlock
+";
+    eqnice!(expected, cmd.stdout());
+});
+
+rgtest!(word_period, |dir: Dir, mut cmd: TestCommand| {
+    dir.create("haystack", "...");
+    cmd.arg("-ow").arg(".").arg("haystack");
+
+    let expected = "\
+.
+.
+.
 ";
     eqnice!(expected, cmd.stdout());
 });
@@ -399,7 +411,7 @@ rgtest!(include_zero, |dir: Dir, mut cmd: TestCommand| {
     cmd.args(&["--count", "--include-zero", "nada"]);
     cmd.assert_err();
 
-    let output = cmd.cmd().output().unwrap();
+    let output = cmd.raw_output();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let expected = "sherlock:0\n";
 
@@ -411,7 +423,7 @@ rgtest!(include_zero_override, |dir: Dir, mut cmd: TestCommand| {
     cmd.args(&["--count", "--include-zero", "--no-include-zero", "nada"]);
     cmd.assert_err();
 
-    let output = cmd.cmd().output().unwrap();
+    let output = cmd.raw_output();
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.is_empty());
 });
@@ -615,7 +627,7 @@ rgtest!(ignore_git_parent, |dir: Dir, mut cmd: TestCommand| {
 
     // Even though we search in foo/, which has no .gitignore, ripgrep will
     // traverse parent directories and respect the gitignore files found.
-    cmd.current_dir(dir.path().join("foo"));
+    cmd.current_dir("foo");
     cmd.assert_err();
 });
 
@@ -639,7 +651,7 @@ rgtest!(ignore_git_parent_stop, |dir: Dir, mut cmd: TestCommand| {
     dir.create_dir("foo/bar");
     dir.create("foo/bar/sherlock", SHERLOCK);
     cmd.arg("Sherlock");
-    cmd.current_dir(dir.path().join("foo").join("bar"));
+    cmd.current_dir("foo/bar");
 
     let expected = "\
 sherlock:For the Doctor Watsons of this world, as opposed to the Sherlock
@@ -670,7 +682,7 @@ rgtest!(ignore_git_parent_stop_file, |dir: Dir, mut cmd: TestCommand| {
     dir.create_dir("foo/bar");
     dir.create("foo/bar/sherlock", SHERLOCK);
     cmd.arg("Sherlock");
-    cmd.current_dir(dir.path().join("foo").join("bar"));
+    cmd.current_dir("foo/bar");
 
     let expected = "\
 sherlock:For the Doctor Watsons of this world, as opposed to the Sherlock
@@ -688,7 +700,7 @@ rgtest!(ignore_ripgrep_parent_no_stop, |dir: Dir, mut cmd: TestCommand| {
     dir.create_dir("foo/bar");
     dir.create("foo/bar/sherlock", SHERLOCK);
     cmd.arg("Sherlock");
-    cmd.current_dir(dir.path().join("foo").join("bar"));
+    cmd.current_dir("foo/bar");
 
     // The top-level .rgignore applies.
     cmd.assert_err();
@@ -721,13 +733,75 @@ rgtest!(no_parent_ignore_git, |dir: Dir, mut cmd: TestCommand| {
     dir.create("foo/sherlock", SHERLOCK);
     dir.create("foo/watson", SHERLOCK);
     cmd.arg("--no-ignore-parent").arg("Sherlock");
-    cmd.current_dir(dir.path().join("foo"));
+    cmd.current_dir("foo");
 
     let expected = "\
 sherlock:For the Doctor Watsons of this world, as opposed to the Sherlock
 sherlock:be, to a very large extent, the result of luck. Sherlock Holmes
 ";
     eqnice!(expected, cmd.stdout());
+});
+
+// Multiple explicit search roots must apply parent .gitignore rules using each
+// root's own path base. Searching `src` before `tests` used to leak the wrong
+// absolute base into cached parent matchers so `src/invalid` was not ignored.
+// See: https://github.com/BurntSushi/ripgrep/issues/3376
+rgtest!(ignore_git_multi_root_order, |dir: Dir, mut cmd: TestCommand| {
+    dir.create_dir(".git");
+    dir.create(".gitignore", "src/invalid\n");
+    dir.create_dir("src");
+    dir.create_dir("tests");
+    dir.create("src/invalid", "this\n");
+    dir.create("src/valid", "this\n");
+    dir.create("tests/valid", "this\n");
+
+    cmd.args(&["--files-with-matches", "this", "src", "tests"]);
+    let got = cmd.stdout();
+    assert!(
+        !got.contains("invalid"),
+        "src/invalid must stay ignored with multiple roots, got:\n{}",
+        got
+    );
+    assert!(got.contains("src/valid"), "missing src/valid in:\n{}", got);
+    assert!(got.contains("tests/valid"), "missing tests/valid in:\n{}", got);
+
+    // Reverse CLI order should behave the same.
+    let mut cmd = dir.command();
+    cmd.args(&["--files-with-matches", "this", "tests", "src"]);
+    let got = cmd.stdout();
+    assert!(
+        !got.contains("invalid"),
+        "src/invalid must stay ignored with roots reversed, got:\n{}",
+        got
+    );
+});
+
+// Same multi-root path-base issue for `.rgignore`.
+// See: https://github.com/BurntSushi/ripgrep/issues/3320
+rgtest!(ignore_rgignore_multi_root_order, |dir: Dir, mut cmd: TestCommand| {
+    dir.create(".rgignore", "beta/**/*.svg\n");
+    dir.create_dir("alpha");
+    dir.create_dir("beta");
+    dir.create("alpha/a.txt", "AWS\n");
+    dir.create("beta/x.svg", "AWS\n");
+
+    cmd.args(&["--files-with-matches", "AWS", "alpha", "beta"]);
+    let got = cmd.stdout();
+    assert!(
+        !got.contains("x.svg"),
+        "beta/x.svg must be ignored with multiple roots, got:\n{}",
+        got
+    );
+    assert!(got.contains("alpha/a.txt"), "missing alpha/a.txt in:\n{}", got);
+
+    let mut cmd = dir.command();
+    cmd.args(&["--files-with-matches", "AWS", "beta", "alpha"]);
+    let got = cmd.stdout();
+    assert!(
+        !got.contains("x.svg"),
+        "beta/x.svg must be ignored with roots reversed, got:\n{}",
+        got
+    );
 });
 
 rgtest!(symlink_nofollow, |dir: Dir, mut cmd: TestCommand| {
@@ -737,7 +811,7 @@ rgtest!(symlink_nofollow, |dir: Dir, mut cmd: TestCommand| {
     dir.create_dir("foo/baz");
     dir.create("foo/baz/sherlock", SHERLOCK);
     cmd.arg("Sherlock");
-    cmd.current_dir(dir.path().join("foo/bar"));
+    cmd.current_dir("foo/bar");
 
     cmd.assert_err();
 });
@@ -750,7 +824,7 @@ rgtest!(symlink_follow, |dir: Dir, mut cmd: TestCommand| {
     dir.create("foo/baz/sherlock", SHERLOCK);
     dir.link_dir("foo/baz", "foo/bar/baz");
     cmd.arg("-L").arg("Sherlock");
-    cmd.current_dir(dir.path().join("foo/bar"));
+    cmd.current_dir("foo/bar");
 
     let expected = "\
 baz/sherlock:For the Doctor Watsons of this world, as opposed to the Sherlock
@@ -1064,4 +1138,61 @@ rgtest!(type_list, |_: Dir, mut cmd: TestCommand| {
     cmd.arg("--type-list");
     // This can change over time, so just make sure we print something.
     assert!(!cmd.stdout().is_empty());
+});
+
+// The following series of tests seeks to test all permutations of ripgrep's
+// sorted queries.
+//
+// They all rely on this setup function, which sets up this particular file
+// structure with a particular creation order:
+//  ├── a             # 1
+//  ├── b             # 4
+//  └── dir           # 2
+//     ├── c          # 3
+//     └── d          # 5
+//
+// This order is important when sorting them by system time-stamps.
+fn sort_setup(dir: Dir) {
+    use std::{thread::sleep, time::Duration};
+    // As reported in https://github.com/BurntSushi/ripgrep/issues/3071
+    // this test fails if sufficient delay is not given on Windows/Aarch64.
+    let delay = if cfg!(all(windows, target_arch = "aarch64")) {
+        Duration::from_millis(1000)
+    } else {
+        Duration::from_millis(100)
+    };
+    let sub_dir = dir.path().join("dir");
+    dir.create("a", "test");
+    sleep(delay);
+    dir.create_dir(&sub_dir);
+    sleep(delay);
+    dir.create(sub_dir.join("c"), "test");
+    sleep(delay);
+    dir.create("b", "test");
+    sleep(delay);
+    dir.create(sub_dir.join("d"), "test");
+}
+
+rgtest!(sort_files, |dir: Dir, mut cmd: TestCommand| {
+    sort_setup(dir);
+    let expected = "a:test\nb:test\ndir/c:test\ndir/d:test\n";
+    eqnice!(expected, cmd.args(["--sort", "path", "test"]).stdout());
+});
+
+rgtest!(sort_accessed, |dir: Dir, mut cmd: TestCommand| {
+    if crate::util::is_cross() {
+        return;
+    }
+    sort_setup(dir);
+    let expected = "a:test\ndir/c:test\nb:test\ndir/d:test\n";
+    eqnice!(expected, cmd.args(["--sort", "accessed", "test"]).stdout());
+});
+
+rgtest!(sortr_accessed, |dir: Dir, mut cmd: TestCommand| {
+    if crate::util::is_cross() {
+        return;
+    }
+    sort_setup(dir);
+    let expected = "dir/d:test\nb:test\ndir/c:test\na:test\n";
+    eqnice!(expected, cmd.args(["--sortr", "accessed", "test"]).stdout());
 });
